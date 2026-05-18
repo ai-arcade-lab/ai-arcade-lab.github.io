@@ -140,6 +140,26 @@ const STAGES = [
   { enemies:[{x:200,y:120},{x:200,y:280,vx:30}], blocks:[] },
   { enemies:[{x:200,y:360},{x:200,y:260},{x:80,y:160,hp:2,maxHp:2,w:36,h:36}],
     blocks:[{x:200,y:160,w:30,h:30,type:'mirror',angle:0}] },
+  // Stage 11: 3 enemies, vertical spread
+  { enemies:[{x:200,y:100},{x:200,y:220},{x:200,y:360}], blocks:[] },
+  // Stage 12: mirror "/" routes bullet right then bounces left
+  { enemies:[{x:200,y:400},{x:320,y:280},{x:60,y:280}], blocks:[{x:200,y:280,w:30,h:30,type:'mirror',angle:1}] },
+  // Stage 13: 4 enemies + mirror
+  { enemies:[{x:200,y:460},{x:200,y:380},{x:320,y:280},{x:60,y:280}], blocks:[{x:200,y:280,w:30,h:30,type:'mirror',angle:1}] },
+  // Stage 14: HP2 double-bounce (bullet hits top wall and returns)
+  { enemies:[{x:200,y:420},{x:200,y:280,hp:2,maxHp:2,w:36,h:36},{x:200,y:100}], blocks:[] },
+  // Stage 15: bomb chain triple-kill
+  { enemies:[{x:200,y:140},{x:140,y:200},{x:260,y:200}], blocks:[{x:200,y:200,w:36,h:36,type:'bomb'}] },
+  // Stage 16: 4 enemies + mirror + HP2 (wall bounce gives second hit)
+  { enemies:[{x:200,y:460},{x:200,y:360},{x:280,y:240,hp:2,maxHp:2,w:36,h:36},{x:60,y:240}], blocks:[{x:200,y:240,w:30,h:30,type:'mirror',angle:1}] },
+  // Stage 17: split launches 45° diagonals to both sides
+  { enemies:[{x:200,y:480},{x:200,y:420},{x:80,y:260},{x:320,y:260}], blocks:[{x:200,y:380,w:30,h:30,type:'split'}] },
+  // Stage 18: bomb chips HP2, bullet finishes it
+  { enemies:[{x:140,y:280},{x:260,y:280},{x:200,y:220,hp:2,maxHp:2,w:36,h:36}], blocks:[{x:200,y:280,w:36,h:36,type:'bomb'}] },
+  // Stage 19: L-shaped 2-mirror path, 5 enemies
+  { enemies:[{x:200,y:460},{x:200,y:380},{x:280,y:300},{x:340,y:380},{x:340,y:460}], blocks:[{x:200,y:300,w:30,h:30,type:'mirror',angle:1},{x:340,y:300,w:30,h:30,type:'mirror',angle:0}] },
+  // Stage 20: boss — 2× HP2 require double-bounce to kill
+  { enemies:[{x:200,y:480},{x:200,y:380,hp:2,maxHp:2,w:36,h:36},{x:200,y:220,hp:2,maxHp:2,w:36,h:36},{x:200,y:80}], blocks:[] },
 ];
 
 // ─── Load stage ───────────────────────────────────────────────────────────────

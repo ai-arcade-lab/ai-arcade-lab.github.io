@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>SYNC//FLOW</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; touch-action: manipulation; }
+    canvas { display: block; }
+    #muteBtn {
+      position: fixed; top: 16px; right: 16px;
+      background: transparent; border: none; color: rgba(255,255,255,0.35);
+      font-size: 18px; cursor: pointer; z-index: 10;
+      touch-action: manipulation; padding: 10px; line-height: 1;
+    }
+    #muteBtn:hover { color: rgba(255,255,255,0.75); }
+    #resultActions {
+      display: none; position: fixed; bottom: 9%; left: 50%;
+      transform: translateX(-50%); flex-direction: row; gap: 14px; z-index: 10;
+    }
+    #resultActions button {
+      background: transparent; border: 1px solid rgba(255,255,255,0.28);
+      color: rgba(255,255,255,0.65); padding: 11px 32px;
+      font-size: 12px; letter-spacing: 0.18em;
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      cursor: pointer; touch-action: manipulation; transition: all 0.2s;
+    }
+    #resultActions button:hover {
+      border-color: rgba(255,255,255,0.7); color: rgba(255,255,255,1);
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<button id="muteBtn">♪</button>
+<div id="resultActions">
+  <button id="shareBtn">SHARE</button>
+  <button id="replayBtn">AGAIN</button>
+</div>
+<script>
+// ─────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────
+const BPM       = 72;
+const BEAT      = 60 / BPM;   // 0.8333s per beat
+const LOOKAHEAD = 0.1;         // seconds to schedule ahead
+
+// Phase boundaries in seconds from game start
+// Phase 1: 0–15s  Phase 2: 15–35s  Phase 3: 35–50s  Phase 4: 50–60s
+const PHASE_SEC = [0, 15, 35, 50, 60];
+
+// Hit tolerance window (±ms), index = phase-1
+const HIT_WIN = [150, 120, 100, 100];
+
+// Audio target params per phase (index 0 = entry / reset)
+const PP = [
+  { bass: 0,    high: 0,    wet: 0,    dry: 1,    pan: 0    },
+  { bass: 0.28, high: 0,    wet: 0.10, dry: 0.94, pan: 0.12 },
+  { bass: 0.58, high: 0.09, wet: 0.32, dry: 0.82, pan: 0.27 },
+  { bass: 0.78, high: 0.27, wet: 0.52, dry: 0.70, pan: 0.36 },
+  { bass: 1.0,  high: 0.52, wet: 0.72, dry: 0.55, pan: 0.40 },
+];
+
+// Sync-rate bonus tiers (applied on top of phase base)
+const SB = [
+  { bass: 0,    wet: 0    },
+  { bass: 0.05, wet: 0.05 },
+  { bass: 0.12, wet: 0.10 },
+  { bass: 0.20, wet: 0.15 },
+];
+
+// ─────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────
+const S = { ENTRY: 0, PLAYING: 1, PAUSED: 2, RESULT: 3 };
+let state = S.ENTRY;
+let result = null;
+let muted  = false;
+
+// Audio nodes
+let ac, masterGain, bassOsc, bassGain, highOsc, highGain;
+let convolver, dryGain, wetGain, panner;
+
+// Game variables
+let gameStartTime = 0;
+let currentPhase  = 1;
+let nextBeatTime  = 0;
+let beatIdx       = 0;
+const scheduledBeats = [];   // { time, idx }
+let hits = 0, misses = 0, opportunities = 0;
+const offsets = [];
+let syncRate = 0;
+let panRange = PP[1].pan;
+const particles = [];
+const audioDepthLog = [];
+let shimmerTick = 0;
+
+// ─────────────────────────────────────────────
+// CANVAS
+// ─────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+let W, H, cx, cy;
+
+function resizeCanvas() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  cx = W / 2; cy = H / 2;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ─────────────────────────────────────────────
+// AUDIO — INIT & NODE GRAPH
+// ─────────────────────────────────────────────
+function initAudio() {
+  if (ac) { ac.resume(); return; }
+  ac = new AudioContext();
+
+  bassOsc = ac.createOscillator();
+  bassOsc.type = 'sine';
+  bassOsc.frequency.value = 50;
+  bassGain = ac.createGain();
+  bassGain.gain.value = 0;
+  bassOsc.connect(bassGain);
+
+  highOsc = ac.createOscillator();
+  highOsc.type = 'sine';
+  highOsc.frequency.value = 2100;
+  highGain = ac.createGain();
+  highGain.gain.value = 0;
+  highOsc.connect(highGain);
+
+  // Master gain (mute control; kept below 1 for headroom)
+  masterGain = ac.createGain();
+  masterGain.gain.value = 0.75;
+  bassGain.connect(masterGain);
+  highGain.connect(masterGain);
+
+  // Reverb
+  convolver = ac.createConvolver();
+  convolver.buffer = makeImpulse();
+
+  // Dry / wet split
+  dryGain = ac.createGain();
+  dryGain.gain.value = 1;
+  wetGain = ac.createGain();
+  wetGain.gain.value = 0;
+
+  // Stereo panner (L/R alternating per beat)
+  panner = ac.createStereoPanner();
+  panner.pan.value = 0;
+
+  // Routing:
+  //   masterGain → dryGain ─────────────→ panner → destination
+  //   masterGain → convolver → wetGain ──→ panner → destination
+  masterGain.connect(dryGain);
+  masterGain.connect(convolver);
+  dryGain.connect(panner);
+  convolver.connect(wetGain);
+  wetGain.connect(panner);
+  panner.connect(ac.destination);
+
+  bassOsc.start();
+  highOsc.start();
+}
+
+function makeImpulse() {
+  const len = Math.floor(ac.sampleRate * 2.0);
+  const buf = ac.createBuffer(2, len, ac.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
+    }
+  }
+  return buf;
+}
+
+// ─────────────────────────────────────────────
+// AUDIO — PARAMETER CONTROL
+// ─────────────────────────────────────────────
+function rampAudio(p, dur) {
+  if (!ac) return;
+  const now = ac.currentTime;
+  const t   = now + dur;
+  [bassGain, highGain, dryGain, wetGain].forEach(g => {
+    g.gain.cancelScheduledValues(now);
+    g.gain.setValueAtTime(g.gain.value, now);
+  });
+  bassGain.gain.linearRampToValueAtTime(p.bass, t);
+  highGain.gain.linearRampToValueAtTime(p.high, t);
+  dryGain.gain.linearRampToValueAtTime(p.dry,   t);
+  wetGain.gain.linearRampToValueAtTime(p.wet,   t);
+  panRange = p.pan;
+}
+
+function setPhaseAudio(phase) { rampAudio(PP[phase], 2.0); }
+
+function resetAudioToEntry() {
+  if (!ac) return;
+  rampAudio(PP[0], 0.5);
+  const now = ac.currentTime;
+  masterGain.gain.cancelScheduledValues(now);
+  masterGain.gain.setTargetAtTime(0.75, now, 0.1);
+  panner.pan.cancelScheduledValues(now);
+  panner.pan.setTargetAtTime(0, now, 0.15);
+}
+
+function applyAudioSyncBonus() {
+  if (!ac || state !== S.PLAYING) return;
+  let tier = 0;
+  if (syncRate > 0.4) tier = 1;
+  if (syncRate > 0.6) tier = 2;
+  if (syncRate > 0.8) tier = 3;
+  const b    = SB[tier];
+  const base = PP[currentPhase];
+  const now  = ac.currentTime;
+  const t    = now + 0.5;
+  bassGain.gain.cancelScheduledValues(now);
+  bassGain.gain.setValueAtTime(bassGain.gain.value, now);
+  bassGain.gain.linearRampToValueAtTime(Math.min(1.2, base.bass + b.bass), t);
+  wetGain.gain.cancelScheduledValues(now);
+  wetGain.gain.setValueAtTime(wetGain.gain.value, now);
+  wetGain.gain.linearRampToValueAtTime(Math.min(0.9, base.wet + b.wet), t);
+  panRange = base.pan + tier * 0.025;
+}
+
+function audioOnHit() {
+  if (!ac) return;
+  const now = ac.currentTime;
+  const cur = bassGain.gain.value;
+  bassGain.gain.cancelScheduledValues(now);
+  bassGain.gain.setValueAtTime(cur, now);
+  bassGain.gain.linearRampToValueAtTime(Math.min(1.3, cur + 0.12), now + 0.03);
+  const target = PP[currentPhase].bass;
+  setTimeout(() => {
+    if (state === S.PLAYING && ac) {
+      const n = ac.currentTime;
+      bassGain.gain.cancelScheduledValues(n);
+      bassGain.gain.setValueAtTime(bassGain.gain.value, n);
+      bassGain.gain.linearRampToValueAtTime(target, n + 0.18);
+    }
+  }, 120);
+  audioDepthLog.push(wetGain.gain.value);
+}
+
+function audioOnMiss() {
+  if (!ac) return;
+  const now = ac.currentTime;
+  masterGain.gain.cancelScheduledValues(now);
+  masterGain.gain.setValueAtTime(masterGain.gain.value, now);
+  masterGain.gain.linearRampToValueAtTime(0.52, now + 0.08);
+  setTimeout(() => {
+    if (state === S.PLAYING && ac) {
+      const n = ac.currentTime;
+      masterGain.gain.cancelScheduledValues(n);
+      masterGain.gain.setValueAtTime(masterGain.gain.value, n);
+      masterGain.gain.linearRampToValueAtTime(0.75, n + 0.28);
+    }
+  }, 350);
+}
+
+// ─────────────────────────────────────────────
+// AUDIO — BEAT SCHEDULER (lookahead pattern)
+// ─────────────────────────────────────────────
+function makeClickBuffer(phase) {
+  const isLate = phase >= 3;
+  const freq   = isLate ? 150 : 760;
+  const dur    = isLate ? 0.009 : 0.004;
+  const len    = Math.floor(ac.sampleRate * dur);
+  const buf    = ac.createBuffer(1, len, ac.sampleRate);
+  const d      = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) {
+    const env   = Math.pow(1 - i / len, 2);
+    const tone  = Math.sin(2 * Math.PI * freq * i / ac.sampleRate);
+    const noise = (Math.random() * 2 - 1) * 0.22;
+    d[i] = (tone + noise) * env;
+  }
+  return buf;
+}
+
+function scheduleClick(t, idx) {
+  if (!ac) return;
+  const buf = makeClickBuffer(currentPhase);
+  const src = ac.createBufferSource();
+  src.buffer = buf;
+  const g = ac.createGain();
+  g.gain.value = currentPhase >= 3 ? 0.30 : 0.42;
+  src.connect(g);
+  g.connect(masterGain);   // through master → mute-safe, reverb included
+  src.start(t);
+
+  // L / R alternating pan per beat
+  const sign = idx % 2 === 0 ? -1 : 1;
+  panner.pan.setTargetAtTime(sign * panRange, t, 0.025);
+}
+
+function schedulerTick() {
+  if (state !== S.PLAYING || !ac) return;
+  while (nextBeatTime < ac.currentTime + LOOKAHEAD) {
+    scheduleClick(nextBeatTime, beatIdx);
+    scheduledBeats.push({ time: nextBeatTime, idx: beatIdx });
+    while (scheduledBeats.length > 12) scheduledBeats.shift();
+    nextBeatTime += BEAT;
+    beatIdx++;
+  }
+}
+
+// ─────────────────────────────────────────────
+// TAP JUDGMENT
+// ─────────────────────────────────────────────
+function onTap() {
+  initAudio();
+  if (state === S.ENTRY)  { startGame(); return; }
+  if (state === S.PAUSED) { togglePause(); return; }
+  if (state !== S.PLAYING || scheduledBeats.length === 0) return;
+
+  const now = ac.currentTime;
+  let nearest = scheduledBeats[0];
+  let minDiff = Math.abs(nearest.time - now);
+  for (const b of scheduledBeats) {
+    const d = Math.abs(b.time - now);
+    if (d < minDiff) { minDiff = d; nearest = b; }
+  }
+
+  const offset = (now - nearest.time) * 1000; // ms
+  const tol    = HIT_WIN[Math.min(currentPhase - 1, 3)];
+  opportunities++;
+
+  if (Math.abs(offset) <= tol) {
+    hits++;
+    offsets.push(offset);
+    audioOnHit();
+    spawnHitParticle();
+  } else {
+    misses++;
+    audioOnMiss();
+  }
+  syncRate = hits / opportunities;
+  applyAudioSyncBonus();
+}
+
+// ─────────────────────────────────────────────
+// GAME LOGIC
+// ─────────────────────────────────────────────
+function startGame() {
+  state         = S.PLAYING;
+  gameStartTime = ac.currentTime;
+  nextBeatTime  = gameStartTime + 0.05;
+  beatIdx       = 0;
+  scheduledBeats.length = 0;
+  hits = misses = opportunities = 0;
+  offsets.length       = 0;
+  syncRate             = 0;
+  currentPhase         = 1;
+  particles.length     = 0;
+  audioDepthLog.length = 0;
+  shimmerTick          = 0;
+  document.getElementById('resultActions').style.display = 'none';
+  setPhaseAudio(1);
+}
+
+function updatePhase() {
+  if (state !== S.PLAYING || !ac) return;
+  const el = ac.currentTime - gameStartTime;
+
+  let ph = 1;
+  if (el >= PHASE_SEC[1]) ph = 2;
+  if (el >= PHASE_SEC[2]) ph = 3;
+  if (el >= PHASE_SEC[3]) ph = 4;
+
+  if (ph !== currentPhase) {
+    currentPhase = ph;
+    setPhaseAudio(ph);
+  }
+  if (el >= 60) endGame();
+}
+
+function endGame() {
+  if (state === S.RESULT) return;
+  state  = S.RESULT;
+  result = calcResult();
+  if (ac && masterGain) {
+    const now = ac.currentTime;
+    masterGain.gain.cancelScheduledValues(now);
+    masterGain.gain.setValueAtTime(masterGain.gain.value, now);
+    masterGain.gain.linearRampToValueAtTime(0, now + 4);
+  }
+  document.getElementById('resultActions').style.display = 'flex';
+}
+
+function togglePause() {
+  if (state === S.PLAYING) {
+    state = S.PAUSED; ac.suspend();
+  } else if (state === S.PAUSED) {
+    state = S.PLAYING; ac.resume();
+  }
+}
+
+function toggleMute() {
+  muted = !muted;
+  if (ac && masterGain) {
+    const now = ac.currentTime;
+    masterGain.gain.cancelScheduledValues(now);
+    masterGain.gain.setValueAtTime(masterGain.gain.value, now);
+    masterGain.gain.setTargetAtTime(muted ? 0 : 0.75, now, 0.1);
+  }
+  document.getElementById('muteBtn').textContent = muted ? '🔇' : '♪';
+}
+
+function resetGame() {
+  state  = S.ENTRY;
+  result = null;
+  muted  = false;
+  document.getElementById('muteBtn').textContent = '♪';
+  document.getElementById('resultActions').style.display = 'none';
+  particles.length = 0;
+  resetAudioToEntry();
+}
+
+// ─────────────────────────────────────────────
+// SCORE CALCULATION
+// ─────────────────────────────────────────────
+function calcResult() {
+  const syncDepth = opportunities > 0
+    ? Math.round(hits / opportunities * 100) : 0;
+
+  let stability = 50, drift = 0;
+  if (offsets.length > 1) {
+    const mean = offsets.reduce((a, b) => a + b, 0) / offsets.length;
+    const variance = offsets.map(x => (x - mean) ** 2).reduce((a, b) => a + b, 0) / offsets.length;
+    drift     = Math.round(Math.abs(mean));
+    stability = Math.max(0, Math.min(100, Math.round(100 - Math.sqrt(variance) * 0.85)));
+  }
+
+  const resonance = audioDepthLog.length > 0
+    ? Math.min(100, Math.round(audioDepthLog.reduce((a, b) => a + b, 0) / audioDepthLog.length * 125))
+    : 0;
+
+  let type;
+  if      (syncDepth >= 80 && stability >= 70) type = 'DEEP SYNC TYPE';
+  else if (syncDepth >= 80)                    type = 'HIGH RESONANCE';
+  else if (syncDepth >= 60)                    type = 'FLOW SENSITIVE';
+  else                                          type = 'LOW DRIFT USER';
+
+  const fuzz = n => Math.min(100, Math.max(0, n + Math.floor(Math.random() * 9) - 4));
+  return {
+    type,
+    syncDepth:  fuzz(syncDepth),
+    stability:  fuzz(stability),
+    drift,
+    resonance:  fuzz(resonance),
+  };
+}
+
+// ─────────────────────────────────────────────
+// PARTICLES
+// ─────────────────────────────────────────────
+function spawnHitParticle() {
+  if (particles.length >= 46) return;
+  for (let i = 0; i < 6; i++) {
+    const a   = Math.random() * Math.PI * 2;
+    const spd = 55 + Math.random() * 65;
+    particles.push({
+      x: cx, y: cy,
+      vx: Math.cos(a) * spd, vy: Math.sin(a) * spd,
+      life: 1, decay: 0.018 + Math.random() * 0.01,
+      r: 1 + Math.random() * 2,
+    });
+  }
+}
+
+function maybeSpawnShimmer() {
+  if (currentPhase < 4 || state !== S.PLAYING || particles.length >= 46) return;
+  shimmerTick++;
+  if (shimmerTick % 4 !== 0) return;
+  const a = Math.random() * Math.PI * 2;
+  const d = 22 + Math.random() * 52;
+  particles.push({
+    x: cx + Math.cos(a) * d, y: cy + Math.sin(a) * d,
+    vx: Math.cos(a) * 10, vy: Math.sin(a) * 10,
+    life: 0.38 + Math.random() * 0.38, decay: 0.007,
+    r: 0.5 + Math.random() * 1.3,
+  });
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += 18 * dt;
+    p.life -= p.decay;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+// ─────────────────────────────────────────────
+// DRAWING
+// ─────────────────────────────────────────────
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+
+function draw() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  if (state === S.ENTRY) {
+    drawEntry();
+  } else if (state === S.PLAYING || state === S.PAUSED) {
+    drawGame();
+    if (state === S.PAUSED) drawPause();
+  } else if (state === S.RESULT) {
+    drawResult();
+  }
+}
+
+function drawEntry() {
+  const t       = performance.now() / 1000;
+  const phrase  = BEAT * 4;
+  const breathe = 0.5 + 0.5 * Math.sin((t % phrase) / phrase * Math.PI * 2);
+
+  // Breathing ring
+  const ringY = cy - H * 0.13;
+  const r     = 36 + breathe * 14;
+  ctx.strokeStyle = `rgba(255,255,255,${(0.07 + breathe * 0.16).toFixed(2)})`;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.arc(cx, ringY, r, 0, Math.PI * 2); ctx.stroke();
+
+  // Outer glow
+  ctx.strokeStyle = `rgba(180,220,255,${(0.02 + breathe * 0.05).toFixed(2)})`;
+  ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.arc(cx, ringY, r + 5, 0, Math.PI * 2); ctx.stroke();
+
+  const fs = Math.min(W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = `300 ${fs * 0.038}px ${FONT}`;
+  ctx.fillText('PUT ON YOUR AIRPODS.', cx, cy + 8);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.33)';
+  ctx.font = `300 ${fs * 0.023}px ${FONT}`;
+  ctx.fillText('TAP TO SYNC', cx, cy + 44);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.font = `300 ${fs * 0.016}px ${FONT}`;
+  ctx.fillText('SYNC//FLOW', cx, H - 26);
+}
+
+function drawGame() {
+  if (!ac) return;
+  drawRing();
+  if (currentPhase === 1) drawBeatDots();
+  drawParticles();
+  if (currentPhase < 4) drawProgressBar();
+}
+
+function drawRing() {
+  const elapsed   = ac.currentTime - gameStartTime;
+  const beatPhase = (elapsed % BEAT) / BEAT;
+  const t = Math.pow(beatPhase, 0.62);
+  const r = 20 + 62 * (1 - t);
+
+  let alpha = 0.88;
+  if (currentPhase === 3) alpha = 0.40;
+  if (currentPhase === 4) alpha = 0.10;
+
+  // Color shifts toward pale cyan as sync increases
+  const rCh = 210 + Math.round(syncRate * 22);
+  const gCh = 210 + Math.round(syncRate * 72);
+  ctx.strokeStyle = `rgba(${rCh},${gCh},255,${alpha.toFixed(2)})`;
+  ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+
+  // Glow ring when well-synced
+  if (syncRate > 0.42) {
+    ctx.strokeStyle = `rgba(${rCh},${gCh},255,${(alpha * 0.11).toFixed(2)})`;
+    ctx.lineWidth = 11;
+    ctx.beginPath(); ctx.arc(cx, cy, r + 6, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+
+function drawBeatDots() {
+  const elapsed = ac.currentTime - gameStartTime;
+  const beat4   = Math.floor(elapsed / BEAT) % 4;
+  for (let i = 0; i < 4; i++) {
+    const angle = (i / 4) * Math.PI * 2 - Math.PI / 2;
+    const rx = cx + Math.cos(angle) * 118;
+    const ry = cy + Math.sin(angle) * 118;
+    const lit = i === beat4;
+    ctx.fillStyle = lit ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.12)';
+    ctx.beginPath(); ctx.arc(rx, ry, lit ? 3 : 2, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const cyan = syncRate > 0.52;
+    ctx.fillStyle = cyan
+      ? `rgba(180,220,255,${p.life.toFixed(2)})`
+      : `rgba(255,255,255,${p.life.toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawProgressBar() {
+  const elapsed = ac.currentTime - gameStartTime;
+  ctx.fillStyle = 'rgba(255,255,255,0.07)';
+  ctx.fillRect(0, H - 2, W * Math.min(1, elapsed / 60), 2);
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(0,0,0,0.62)';
+  ctx.fillRect(0, 0, W, H);
+  const fs = Math.min(W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.82)';
+  ctx.font = `300 ${fs * 0.038}px ${FONT}`;
+  ctx.fillText('PAUSED', cx, cy - 8);
+  ctx.fillStyle = 'rgba(255,255,255,0.28)';
+  ctx.font = `300 ${fs * 0.022}px ${FONT}`;
+  ctx.fillText('TAP TO RESUME', cx, cy + 28);
+}
+
+function drawResult() {
+  if (!result) return;
+  const fs = Math.min(W, H);
+  ctx.textAlign = 'center';
+
+  // Decorative rings
+  const ringY = H * 0.20;
+  [55, 72, 90].forEach(r => {
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(cx, ringY, r, 0, Math.PI * 2); ctx.stroke();
+  });
+  for (let i = 4; i > 0; i--) {
+    ctx.strokeStyle = `rgba(180,220,255,${(0.014 * i).toFixed(3)})`;
+    ctx.lineWidth = i * 4;
+    ctx.beginPath(); ctx.arc(cx, ringY, 68 + i * 8, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  // Player type
+  ctx.fillStyle = 'rgba(255,255,255,0.95)';
+  ctx.font = `300 ${fs * 0.046}px ${FONT}`;
+  ctx.fillText(result.type, cx, H * 0.39);
+
+  // Metrics
+  const metrics = [
+    ['SYNC DEPTH', result.syncDepth + '%'],
+    ['STABILITY',  result.stability + '%'],
+    ['DRIFT',      result.drift + 'ms'],
+    ['RESONANCE',  result.resonance + '%'],
+  ];
+  const spacing = Math.min(H * 0.088, 60);
+  const startY  = H * 0.50;
+  metrics.forEach(([label, val], i) => {
+    const y = startY + i * spacing;
+    ctx.fillStyle = 'rgba(255,255,255,0.28)';
+    ctx.font = `300 ${fs * 0.019}px ${FONT}`;
+    ctx.fillText(label, cx, y);
+    ctx.fillStyle = 'rgba(255,255,255,0.88)';
+    ctx.font = `300 ${fs * 0.031}px ${FONT}`;
+    ctx.fillText(val, cx, y + fs * 0.027);
+  });
+
+  // Comparison message
+  const cmp = Math.min(99, 58 + Math.floor(result.syncDepth * 0.32));
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
+  ctx.font = `300 ${fs * 0.017}px ${FONT}`;
+  ctx.fillText(`You synchronized deeper than ${cmp}% of users.`, cx, H * 0.91);
+}
+
+// ─────────────────────────────────────────────
+// SHARE IMAGE (OffscreenCanvas)
+// ─────────────────────────────────────────────
+async function generateShareImage() {
+  let sc, ocRef;
+  try {
+    ocRef = new OffscreenCanvas(1200, 630);
+    sc    = ocRef.getContext('2d');
+  } catch (_) {
+    ocRef = document.createElement('canvas');
+    ocRef.width = 1200; ocRef.height = 630;
+    sc = ocRef.getContext('2d');
+  }
+
+  sc.fillStyle = '#000';
+  sc.fillRect(0, 0, 1200, 630);
+
+  // Decorative rings
+  [68, 95, 122, 149].forEach(r => {
+    sc.strokeStyle = 'rgba(255,255,255,0.05)';
+    sc.lineWidth = 1;
+    sc.beginPath(); sc.arc(600, 215, r, 0, Math.PI * 2); sc.stroke();
+  });
+  for (let i = 5; i > 0; i--) {
+    sc.strokeStyle = `rgba(180,220,255,${(0.012 * i).toFixed(3)})`;
+    sc.lineWidth = i * 5;
+    sc.beginPath(); sc.arc(600, 215, 90 + i * 13, 0, Math.PI * 2); sc.stroke();
+  }
+
+  const SF = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+  sc.textAlign = 'center';
+  sc.fillStyle = 'rgba(255,255,255,0.95)';
+  sc.font = `300 44px ${SF}`;
+  sc.fillText(result.type, 600, 380);
+
+  const mets = [
+    ['SYNC DEPTH', result.syncDepth + '%'],
+    ['STABILITY',  result.stability + '%'],
+    ['DRIFT',      result.drift + 'ms'],
+    ['RESONANCE',  result.resonance + '%'],
+  ];
+  mets.forEach(([l, v], i) => {
+    const x = 300 + (i % 2) * 300 + 150;
+    const y = i < 2 ? 468 : 554;
+    sc.fillStyle = 'rgba(255,255,255,0.35)';
+    sc.font = `300 14px ${SF}`;
+    sc.fillText(l, x, y - 16);
+    sc.fillStyle = 'rgba(255,255,255,0.9)';
+    sc.font = `300 26px ${SF}`;
+    sc.fillText(v, x, y + 10);
+  });
+
+  sc.fillStyle = 'rgba(255,255,255,0.42)';
+  sc.font = `300 15px ${SF}`;
+  sc.textAlign = 'left';
+  sc.fillText('USE AIRPODS.', 55, 606);
+  sc.textAlign = 'right';
+  sc.fillText('SYNC//FLOW', 1145, 606);
+
+  if (typeof OffscreenCanvas !== 'undefined' && ocRef instanceof OffscreenCanvas) {
+    const blob = await ocRef.convertToBlob({ type: 'image/png' });
+    return URL.createObjectURL(blob);
+  }
+  return ocRef.toDataURL('image/png');
+}
+
+// ─────────────────────────────────────────────
+// INPUT
+// ─────────────────────────────────────────────
+canvas.addEventListener('pointerdown', e => { e.preventDefault(); onTap(); });
+
+document.addEventListener('keydown', e => {
+  if (e.key === ' ') { e.preventDefault(); onTap(); }
+  if ((e.key === 'p' || e.key === 'P') && (state === S.PLAYING || state === S.PAUSED)) {
+    togglePause();
+  }
+  if (e.key === 'm' || e.key === 'M') toggleMute();
+});
+
+document.getElementById('muteBtn').addEventListener('click', e => {
+  e.stopPropagation(); toggleMute();
+});
+
+document.getElementById('shareBtn').addEventListener('click', async e => {
+  e.stopPropagation();
+  if (!result) return;
+  const text = `${result.type} — SYNC DEPTH ${result.syncDepth}%\n\nAirPodsで最後までやってほしい\n#SYNCFLOW`;
+  window.open('https://twitter.com/intent/tweet?text=' + encodeURIComponent(text));
+  try {
+    const url = await generateShareImage();
+    const a   = document.createElement('a');
+    a.href = url; a.download = 'syncflow.png'; a.click();
+  } catch (_) {}
+});
+
+document.getElementById('replayBtn').addEventListener('click', e => {
+  e.stopPropagation(); resetGame();
+});
+
+// ─────────────────────────────────────────────
+// MAIN LOOP
+// ─────────────────────────────────────────────
+let lastTime = 0;
+function loop(ts) {
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+  schedulerTick();
+  updatePhase();
+  updateParticles(dt);
+  maybeSpawnShimmer();
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(loop); });
+</script>
+</body>
+</html>

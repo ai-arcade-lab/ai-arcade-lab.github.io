@@ -95,6 +95,8 @@ let panRange = PP[1].pan;
 const particles = [];
 const audioDepthLog = [];
 let shimmerTick = 0;
+let hitFlash  = 0;   // 0–1, decays; drives ring expansion
+let missFlash = 0;   // 0–1, decays; drives ring dim
 
 // ─────────────────────────────────────────────
 // CANVAS
@@ -217,7 +219,7 @@ function applyAudioSyncBonus() {
   const b    = SB[tier];
   const base = PP[currentPhase];
   const now  = ac.currentTime;
-  const t    = now + 0.5;
+  const t    = now + 0.2;  // faster response = more perceivable
   bassGain.gain.cancelScheduledValues(now);
   bassGain.gain.setValueAtTime(bassGain.gain.value, now);
   bassGain.gain.linearRampToValueAtTime(Math.min(1.2, base.bass + b.bass), t);
@@ -230,10 +232,12 @@ function applyAudioSyncBonus() {
 function audioOnHit() {
   if (!ac) return;
   const now = ac.currentTime;
+
+  // Bass burst
   const cur = bassGain.gain.value;
   bassGain.gain.cancelScheduledValues(now);
   bassGain.gain.setValueAtTime(cur, now);
-  bassGain.gain.linearRampToValueAtTime(Math.min(1.3, cur + 0.12), now + 0.03);
+  bassGain.gain.linearRampToValueAtTime(Math.min(1.3, cur + 0.18), now + 0.03);
   const target = PP[currentPhase].bass;
   setTimeout(() => {
     if (state === S.PLAYING && ac) {
@@ -242,24 +246,54 @@ function audioOnHit() {
       bassGain.gain.setValueAtTime(bassGain.gain.value, n);
       bassGain.gain.linearRampToValueAtTime(target, n + 0.18);
     }
-  }, 120);
+  }, 100);
+
+  // High-frequency ping (descending tone = satisfying "ding")
+  const ping = ac.createOscillator();
+  ping.type = 'sine';
+  ping.frequency.setValueAtTime(1400, now);
+  ping.frequency.exponentialRampToValueAtTime(700, now + 0.18);
+  const pingGain = ac.createGain();
+  pingGain.gain.setValueAtTime(0.18, now);
+  pingGain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+  ping.connect(pingGain);
+  pingGain.connect(masterGain);
+  ping.start(now); ping.stop(now + 0.22);
+
   audioDepthLog.push(wetGain.gain.value);
+  hitFlash = 1;
 }
 
 function audioOnMiss() {
   if (!ac) return;
   const now = ac.currentTime;
+
+  // Deep volume dip — very audible drop
   masterGain.gain.cancelScheduledValues(now);
   masterGain.gain.setValueAtTime(masterGain.gain.value, now);
-  masterGain.gain.linearRampToValueAtTime(0.52, now + 0.08);
+  masterGain.gain.linearRampToValueAtTime(0.28, now + 0.07);
   setTimeout(() => {
     if (state === S.PLAYING && ac) {
       const n = ac.currentTime;
       masterGain.gain.cancelScheduledValues(n);
       masterGain.gain.setValueAtTime(masterGain.gain.value, n);
-      masterGain.gain.linearRampToValueAtTime(0.75, n + 0.28);
+      masterGain.gain.linearRampToValueAtTime(0.75, n + 0.35);
     }
-  }, 350);
+  }, 380);
+
+  // Low thud (descending pitch = "wrong" feel)
+  const thud = ac.createOscillator();
+  thud.type = 'sine';
+  thud.frequency.setValueAtTime(130, now);
+  thud.frequency.exponentialRampToValueAtTime(35, now + 0.14);
+  const thudGain = ac.createGain();
+  thudGain.gain.setValueAtTime(0.22, now);
+  thudGain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+  thud.connect(thudGain);
+  thudGain.connect(masterGain);
+  thud.start(now); thud.stop(now + 0.18);
+
+  missFlash = 1;
 }
 
 // ─────────────────────────────────────────────
@@ -559,21 +593,39 @@ function drawRing() {
   const elapsed   = ac.currentTime - gameStartTime;
   const beatPhase = (elapsed % BEAT) / BEAT;
   const t = Math.pow(beatPhase, 0.62);
-  const r = 20 + 62 * (1 - t);
+  let r = 20 + 62 * (1 - t);
+
+  // Hit flash: ring expands outward
+  if (hitFlash > 0) r += hitFlash * 28;
 
   let alpha = 0.88;
   if (currentPhase === 3) alpha = 0.40;
   if (currentPhase === 4) alpha = 0.10;
 
-  // Color shifts toward pale cyan as sync increases
-  const rCh = 210 + Math.round(syncRate * 22);
-  const gCh = 210 + Math.round(syncRate * 72);
+  // Miss flash: ring dims
+  if (missFlash > 0) alpha *= (1 - missFlash * 0.72);
+
+  // Color: normal = white→cyan, miss = briefly cool-dim
+  let rCh = 210 + Math.round(syncRate * 22);
+  let gCh = 210 + Math.round(syncRate * 72);
+  if (missFlash > 0) {
+    rCh = Math.round(rCh * (1 - missFlash * 0.4));
+    gCh = Math.round(gCh * (1 - missFlash * 0.5));
+  }
+
   ctx.strokeStyle = `rgba(${rCh},${gCh},255,${alpha.toFixed(2)})`;
   ctx.lineWidth = 1.6;
   ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
 
-  // Glow ring when well-synced
-  if (syncRate > 0.42) {
+  // Hit expansion ring (bright white flash)
+  if (hitFlash > 0) {
+    ctx.strokeStyle = `rgba(255,255,255,${(hitFlash * 0.55).toFixed(2)})`;
+    ctx.lineWidth = hitFlash * 12;
+    ctx.beginPath(); ctx.arc(cx, cy, r + hitFlash * 8, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  // Sync glow ring (no extra element when hit-flashing)
+  if (syncRate > 0.42 && hitFlash < 0.1) {
     ctx.strokeStyle = `rgba(${rCh},${gCh},255,${(alpha * 0.11).toFixed(2)})`;
     ctx.lineWidth = 11;
     ctx.beginPath(); ctx.arc(cx, cy, r + 6, 0, Math.PI * 2); ctx.stroke();
@@ -781,6 +833,8 @@ function loop(ts) {
   updatePhase();
   updateParticles(dt);
   maybeSpawnShimmer();
+  if (hitFlash  > 0) hitFlash  = Math.max(0, hitFlash  - dt * 5);
+  if (missFlash > 0) missFlash = Math.max(0, missFlash - dt * 3.5);
   draw();
   requestAnimationFrame(loop);
 }
